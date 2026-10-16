@@ -2542,5 +2542,321 @@ addEventListener("beforeunload", save);
 setInterval(()=>{ if($("title").style.display==="none") save(); }, 15000);
 if(new URLSearchParams(location.search).get("room")) setTimeout(()=>window.__mpOpen(), 700);
 </script>
+<!-- crisp-photo:start (ระบบกลาง/crisp-photo.js) -->
+<script>
+/* crisp-photo.js — ภาพนิ่งคมตรงพิกเซลจอ สำหรับเกมภาพถ่าย (point-and-click) · 16 ต.ค. 69
+ *
+ * ปัญหาที่วัดได้ (ฟิล์มม้วนสุดท้าย ฯลฯ): ภาพ 2752×1536 ถูกเบราว์เซอร์ย่อเองบนการ์ดจอ
+ *   - ย่อแรง (หน้าต่างเล็ก/มือถือ/ภาพซูม) = แตกเป็นเม็ด-ขอบหยัก (ไม่มี mipmap)
+ *   - วางเหลื่อมเศษพิกเซล (กรอบกลางจอ, ภาพซูมในกล่อง) = นุ่ม
+ *   - createImageBitmap(resizeQuality) บน Chrome GPU ไม่สนค่า quality เลย (วัดแล้วเท่ากันทั้ง 3 ค่า)
+ * วิธีแก้: ทับ <img> ด้วยผ้าใบที่ "พิกเซลเท่าจอเป๊ะ ชิดเส้นพิกเซล" แล้วย่อภาพเองด้วย Lanczos3 ใน worker
+ *   (ไม่กินเฟรม · เกมไม่ต้องแก้อะไร · <img> เดิมยังเป็นตัวจริง ผ้าใบแค่ทับตอนพร้อม)
+ *   worker ดึงภาพเองด้วย fetch (CDN ให้ CORS · โหลดซ้ำแค่ ~390 ไบต์จากแคช)
+ *   ดึงไม่ได้ → ใช้ภาพที่ <img> โหลดแล้ว ย่อแบบ mipmap ในผ้าใบ (ยังดีกว่าเดิม)
+ *   ไม่มี worker → ย่อ mipmap บนเธรดหลัก
+ *
+ * ใช้: วาง <script> ไฟล์นี้ก่อน </body> → จับ #sceneimg กับ #cuImg ให้เอง
+ *      หรือ CrispPhoto.attach(imgElement) กับภาพอื่น
+ * ปิดทดสอบ: ?crisp=0   ดูสถิติ: CrispPhoto.stats()
+ * ภาพที่ยืดด้วย transform (title ลอยไปมา) ไม่ได้จัดการ — ใช้กับภาพที่นิ่งเท่านั้น
+ */
+(function () {
+  "use strict";
+  if (window.CrispPhoto) return;
+  var OFF = /[?&]crisp=0\b/.test(location.search);
+  var LOG = [];
+  function log(o) { LOG.push(o); if (LOG.length > 40) LOG.shift(); }
+
+  /* ---------------- worker: Lanczos3 ---------------- */
+  var WORKER_SRC = function () {
+    var cache = {};           // role -> {url, w, h, data(Uint8ClampedArray), alpha, bmp}
+    function lanczos(x) {
+      if (x === 0) return 1;
+      if (x <= -3 || x >= 3) return 0;
+      var px = Math.PI * x;
+      return 3 * Math.sin(px) * Math.sin(px / 3) / (px * px);
+    }
+    // weights for mapping dst[0..n) <- src range [s0, s0+sl) of an axis with srcLen pixels
+    function weights(n, s0, sl, srcLen) {
+      var scale = sl / n, fs = Math.max(scale, 1), sup = 3 * fs;
+      var start = new Int32Array(n), cnt = new Int32Array(n), maxc = Math.ceil(sup * 2) + 2;
+      var w = new Float32Array(n * maxc);
+      for (var i = 0; i < n; i++) {
+        var c = s0 + (i + 0.5) * scale - 0.5;
+        var a = Math.floor(c - sup) + 1, b = Math.floor(c + sup), k = 0, sum = 0;
+        if (b - a + 1 > maxc) b = a + maxc - 1;
+        start[i] = a;
+        for (var j = a; j <= b; j++, k++) { var v = lanczos((j - c) / fs); w[i * maxc + k] = v; sum += v; }
+        cnt[i] = k;
+        if (sum) for (k = 0; k < cnt[i]; k++) w[i * maxc + k] /= sum;
+      }
+      return { start: start, cnt: cnt, w: w, maxc: maxc, len: srcLen };
+    }
+    function resample(src, sw, sh, ch, sx, sy, cw, chh, W, H) {
+      var X = weights(W, sx, cw, sw), Y = weights(H, sy, chh, sh);
+      var y0 = Math.max(0, Y.start[0]), y1 = Math.min(sh - 1, Y.start[H - 1] + Y.cnt[H - 1] - 1);
+      var rows = y1 - y0 + 1, tmp = new Float32Array(rows * W * ch), x, y, k, c, i;
+      for (y = 0; y < rows; y++) {
+        var ro = (y + y0) * sw * 4, to = y * W * ch;
+        for (x = 0; x < W; x++) {
+          var st = X.start[x], n = X.cnt[x], wo = x * X.maxc, r = 0, g = 0, b = 0, a = 0;
+          for (k = 0; k < n; k++) {
+            var j = st + k; if (j < 0) j = 0; else if (j >= sw) j = sw - 1;
+            var wt = X.w[wo + k], p = ro + j * 4;
+            r += src[p] * wt; g += src[p + 1] * wt; b += src[p + 2] * wt;
+            if (ch === 4) a += src[p + 3] * wt;
+          }
+          i = to + x * ch; tmp[i] = r; tmp[i + 1] = g; tmp[i + 2] = b; if (ch === 4) tmp[i + 3] = a;
+        }
+      }
+      var out = new Uint8ClampedArray(W * H * 4);
+      for (y = 0; y < H; y++) {
+        var st2 = Y.start[y], n2 = Y.cnt[y], wo2 = y * Y.maxc, oo = y * W * 4;
+        for (x = 0; x < W; x++) {
+          var r2 = 0, g2 = 0, b2 = 0, a2 = 0, xo = x * ch;
+          for (k = 0; k < n2; k++) {
+            var jj = st2 + k; if (jj < y0) jj = y0; else if (jj > y1) jj = y1;
+            var wt2 = Y.w[wo2 + k], q = (jj - y0) * W * ch + xo;
+            r2 += tmp[q] * wt2; g2 += tmp[q + 1] * wt2; b2 += tmp[q + 2] * wt2;
+            if (ch === 4) a2 += tmp[q + 3] * wt2;
+          }
+          c = oo + x * 4; out[c] = r2; out[c + 1] = g2; out[c + 2] = b2; out[c + 3] = ch === 4 ? a2 : 255;
+        }
+      }
+      return out;
+    }
+    function decodeFull(bmp) {
+      var oc = new OffscreenCanvas(bmp.width, bmp.height), cx = oc.getContext("2d", { willReadFrequently: true });
+      cx.drawImage(bmp, 0, 0);
+      var d = cx.getImageData(0, 0, bmp.width, bmp.height).data, alpha = false;   // throws if tainted
+      for (var i = 3; i < d.length; i += 4) if (d[i] !== 255) { alpha = true; break; }
+      return { w: bmp.width, h: bmp.height, data: d, alpha: alpha };
+    }
+    function getSource(m) {
+      var c = cache[m.role];
+      if (c && c.url === m.url) return Promise.resolve(c);
+      var p;
+      if (m.bmp) p = Promise.resolve(m.bmp);
+      else p = fetch(m.url, { mode: "cors", credentials: "omit" }).then(function (r) {
+        if (!r.ok) throw new Error("http " + r.status); return r.blob();
+      }).then(function (b) { return createImageBitmap(b); });
+      return p.then(function (bmp) {
+        var s;
+        try { s = decodeFull(bmp); s.mode = "lanczos"; }
+        catch (e) { s = { w: bmp.width, h: bmp.height, mode: "mip" }; }   // tainted: keep bitmap, mipmap path
+        s.url = m.url; s.bmp = bmp;
+        var old = cache[m.role];
+        if (old && old.bmp && old.bmp !== bmp) try { old.bmp.close(); } catch (e) {}
+        if (s.data) { try { bmp.close(); } catch (e) {} s.bmp = null; }   // pixels kept, bitmap not needed
+        cache[m.role] = s;
+        return s;
+      });
+    }
+    self.onmessage = function (ev) {
+      var m = ev.data, t0 = performance.now();
+      getSource(m).then(function (s) {
+        var t1 = performance.now(), W = m.W, H = m.H, out;
+        var oc = new OffscreenCanvas(W, H), cx = oc.getContext("2d");
+        // crop is given in fractions of the source so it survives a different decoded size
+        var sx = m.cx * s.w, sy = m.cy * s.h, cw = m.cw * s.w, chh = m.ch * s.h;
+        if (s.mode === "lanczos") {
+          out = resample(s.data, s.w, s.h, s.alpha ? 4 : 3, sx, sy, cw, chh, W, H);
+          cx.putImageData(new ImageData(out, W, H), 0, 0);
+        } else {
+          cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = "high";
+          cx.drawImage(s.bmp, sx, sy, cw, chh, 0, 0, W, H);
+        }
+        var bmp = oc.transferToImageBitmap();
+        self.postMessage({ id: m.id, bmp: bmp, mode: s.mode, decodeMs: Math.round(t1 - t0),
+          resampleMs: Math.round(performance.now() - t1), src: [s.w, s.h] }, [bmp]);
+      }).catch(function (e) { self.postMessage({ id: m.id, err: String(e && e.message || e) }); });
+    };
+  };
+
+  var worker = null, seq = 0, pending = {};
+  function getWorker() {
+    if (worker !== null) return worker;
+    try {
+      var url = URL.createObjectURL(new Blob(["(" + WORKER_SRC.toString() + ")()"], { type: "text/javascript" }));
+      worker = new Worker(url);
+      worker.onmessage = function (ev) { var cb = pending[ev.data.id]; delete pending[ev.data.id]; if (cb) cb(ev.data); };
+      worker.onerror = function () { worker = false; };
+    } catch (e) { worker = false; }
+    return worker;
+  }
+  function ask(msg, transfer) {
+    return new Promise(function (res) {
+      var w = getWorker(); if (!w) return res({ err: "no worker" });
+      msg.id = ++seq; pending[msg.id] = res; w.postMessage(msg, transfer || []);
+    });
+  }
+
+  /* ---------------- per-image overlay ---------------- */
+  function pct(v, free) {   // object-position component -> fraction of free space
+    v = String(v || "50%").trim();
+    if (v === "left" || v === "top") return 0;
+    if (v === "right" || v === "bottom") return 1;
+    if (v === "center") return 0.5;
+    if (/%$/.test(v)) return parseFloat(v) / 100;
+    var px = parseFloat(v); return free ? (isFinite(px) ? px / free : 0.5) : 0.5;
+  }
+
+  function attach(img, role) {
+    if (!img || img.__crisp || OFF) return;
+    role = role || img.id || "img";
+    var cv = document.createElement("canvas");
+    cv.className = "crisp-photo";
+    cv.setAttribute("aria-hidden", "true");
+    cv.style.cssText = "position:absolute;left:0;top:0;transform-origin:0 0;image-rendering:pixelated;pointer-events:none;visibility:hidden;margin:0;padding:0;border:0;max-width:none;max-height:none";
+    img.insertAdjacentElement("afterend", cv);
+    var par = img.parentElement;
+    if (getComputedStyle(par).position === "static") par.style.position = "relative";
+    var st = { shown: false, key: "", job: 0, timer: 0, ignore: 0 };
+    img.__crisp = st;
+
+    function mirror() {
+      var cs = getComputedStyle(img);
+      cv.style.opacity = img.style.opacity !== "" ? img.style.opacity : cs.opacity;
+      cv.style.transition = cs.transition;
+      cv.style.filter = cs.filter === "none" ? "" : cs.filter;
+      cv.style.borderRadius = cs.borderRadius;
+    }
+    function hide() {
+      if (!st.shown) return;
+      st.shown = false; cv.style.visibility = "hidden";
+      if (img.style.visibility) { st.ignore++; img.style.visibility = ""; }
+    }
+    function show() {
+      st.shown = true; mirror(); cv.style.visibility = "visible";
+      if (img.style.visibility !== "hidden") { st.ignore++; img.style.visibility = "hidden"; }
+    }
+    function geometry() {
+      var cs = getComputedStyle(img);
+      if (cs.display === "none" || !img.complete || !img.naturalWidth) return null;
+      var r = img.getBoundingClientRect(); if (r.width < 2 || r.height < 2) return null;
+      var d = window.devicePixelRatio || 1;
+      // content box (inside border+padding)
+      var bl = parseFloat(cs.borderLeftWidth) + parseFloat(cs.paddingLeft), bt = parseFloat(cs.borderTopWidth) + parseFloat(cs.paddingTop);
+      var br = parseFloat(cs.borderRightWidth) + parseFloat(cs.paddingRight), bb = parseFloat(cs.borderBottomWidth) + parseFloat(cs.paddingBottom);
+      var bx = r.left + bl, by = r.top + bt, bw = r.width - bl - br, bh = r.height - bt - bb;
+      var nw = img.naturalWidth, nh = img.naturalHeight, fit = cs.objectFit || "fill";
+      var pcs = getComputedStyle(par), clips = fit === "cover" && pcs.overflow !== "visible" &&
+        Math.abs(r.width - par.clientWidth) < 1 && Math.abs(r.height - par.clientHeight) < 1;
+      var dw = bw, dh = bh;                                      // drawn image size (css px)
+      if (fit === "cover" || fit === "contain" || fit === "scale-down") {
+        var s = fit === "cover" ? Math.max(bw / nw, bh / nh) : Math.min(bw / nw, bh / nh);
+        if (fit === "scale-down") s = Math.min(s, 1);
+        dw = nw * s; dh = nh * s;
+      } else if (fit === "none") { dw = nw; dh = nh; }
+      var pos = cs.objectPosition.split(/\s+/);
+      var ix = bx + (bw - dw) * pct(pos[0], bw - dw), iy = by + (bh - dh) * pct(pos[1], bh - dh);
+      // visible part = drawn image ∩ content box, snapped to device pixels
+      var vx0 = Math.max(bx, ix), vy0 = Math.max(by, iy), vx1 = Math.min(bx + bw, ix + dw), vy1 = Math.min(by + bh, iy + dh);
+      var L = Math.round(vx0 * d), T = Math.round(vy0 * d), R = Math.round(vx1 * d), B = Math.round(vy1 * d);
+      // Chrome may land the canvas 1 device px off at odd dpr → bleed 1 px past a box the parent clips anyway
+      if (clips) { L -= 1; T -= 1; R += 1; B += 1; }
+      var W = R - L, H = B - T; if (W < 2 || H < 2) return null;
+      // source crop (fractions of natural size) that maps onto device rect [L,R)x[T,B)
+      var cx = (L / d - ix) / dw, cy = (T / d - iy) / dh, cw = (W / d) / dw, ch = (H / d) / dh;
+      // canvas position inside the positioned parent (scrolls with it)
+      var pr = par.getBoundingClientRect();
+      var left = L / d - pr.left - par.clientLeft + par.scrollLeft, top = T / d - pr.top - par.clientTop + par.scrollTop;
+      return { d: d, L: L, T: T, W: W, H: H, cx: cx, cy: cy, cw: cw, ch: ch, left: left, top: top,
+        src: img.currentSrc || img.src, key: [img.currentSrc || img.src, L, T, W, H, d].join("|") };
+    }
+    function run() {
+      st.timer = 0;
+      var g = geometry();
+      if (!g) { hide(); st.key = ""; return; }
+      if (g.key === st.key && (st.shown || st.busy === g.key)) return;   // already showing / already being made
+      if (g.key !== st.key) hide();
+      st.key = g.key; st.busy = g.key;
+      var job = ++st.job, t0 = performance.now();
+      var place = function (bmp, info) {
+        if (job !== st.job) { if (bmp && bmp.close) bmp.close(); return; }
+        st.busy = null;
+        var g2 = geometry();
+        if (!g2 || g2.key !== g.key) { if (bmp && bmp.close) bmp.close(); schedule(); return; }
+        cv.width = g.W; cv.height = g.H;
+        // CSS layout keeps 1/64 px, so W/dpr is not exact at dpr 1.25·1.5625·3 → Chrome then rescales = soft.
+        // Size the box in whole px (= device px) and shrink with a float transform instead: lands 1:1.
+        cv.style.width = g.W + "px"; cv.style.height = g.H + "px";
+        cv.style.transform = "translate(" + g.left + "px," + g.top + "px) scale(" + (1 / g.d) + ")";
+        var cx = cv.getContext("2d");
+        cx.imageSmoothingEnabled = false;
+        cx.clearRect(0, 0, g.W, g.H); cx.drawImage(bmp, 0, 0);
+        if (bmp.close) bmp.close();
+        show();
+        info.ms = Math.round(performance.now() - t0); info.role = role; info.W = g.W; info.H = g.H; info.dpr = g.d;
+        log(info);
+      };
+      var fallback = function (why) {
+        // main-thread mipmap path from the already-loaded <img>
+        createImageBitmap(img).then(function (full) {
+          var oc = document.createElement("canvas"); oc.width = g.W; oc.height = g.H;
+          var c2 = oc.getContext("2d"); c2.imageSmoothingEnabled = true; c2.imageSmoothingQuality = "high";
+          c2.drawImage(full, g.cx * full.width, g.cy * full.height, g.cw * full.width, g.ch * full.height, 0, 0, g.W, g.H);
+          full.close(); place(oc, { mode: "mip-main", why: why });
+        }).catch(function () { st.key = ""; st.busy = null; });
+      };
+      if (!getWorker()) return fallback("no worker");
+      ask({ role: role, url: g.src, W: g.W, H: g.H, cx: g.cx, cy: g.cy, cw: g.cw, ch: g.ch }).then(function (r) {
+        if (job !== st.job) { if (r.bmp) r.bmp.close(); return; }
+        if (r.bmp) return place(r.bmp, { mode: r.mode, decodeMs: r.decodeMs, resampleMs: r.resampleMs, src: r.src });
+        // worker could not fetch (no CORS / offline): hand it the decoded <img> instead
+        createImageBitmap(img).then(function (full) {
+          return ask({ role: role, url: g.src + "#img", bmp: full, W: g.W, H: g.H, cx: g.cx, cy: g.cy, cw: g.cw, ch: g.ch }, [full]);
+        }).then(function (r2) {
+          if (r2 && r2.bmp) place(r2.bmp, { mode: r2.mode, why: r.err, resampleMs: r2.resampleMs });
+          else fallback(r2 && r2.err);
+        }).catch(function (e) { fallback(String(e)); });
+      });
+    }
+    function schedule(now) {
+      if (st.timer) clearTimeout(st.timer);
+      st.timer = setTimeout(run, now ? 0 : 140);
+    }
+    // the game keeps driving <img>: src, opacity, display, filter
+    new MutationObserver(function (ms) {
+      ms = ms.filter(function (m) { if (m.attributeName === "style" && st.ignore > 0) { st.ignore--; return false; } return true; });
+      if (!ms.length) return;
+      var srcChanged = ms.some(function (m) { return m.attributeName === "src"; });
+      if (srcChanged) { st.job++; st.busy = null; hide(); st.key = ""; }
+      mirror();
+      if (getComputedStyle(img).display === "none") hide();
+      schedule(srcChanged);
+    }).observe(img, { attributes: true, attributeFilter: ["src", "style", "class", "srcset"] });
+    img.addEventListener("load", function () { schedule(true); });
+    img.addEventListener("error", function () { st.job++; st.busy = null; hide(); st.key = ""; });
+    if (window.ResizeObserver) new ResizeObserver(function () { var g = geometry(); if (!g || g.key !== st.key) { hide(); schedule(); } }).observe(img);
+    st.schedule = schedule; st.geometry = geometry; st.hide = hide;
+    ALL.push(st);
+    mirror();
+    if (img.complete && img.naturalWidth) schedule(true);
+  }
+
+  var ALL = [];
+  // geometry changed (resize / browser zoom / other screen): drop the canvas at once — the <img> shows
+  // until the new exact-size copy is ready (a stale pixelated canvas would look blocky meanwhile)
+  function relayoutAll() { ALL.forEach(function (st) { var g = st.geometry(); if (!g || g.key !== st.key) { st.hide(); st.schedule(); } }); }
+  addEventListener("resize", relayoutAll);
+  // safety net: a box can move without resize/ResizeObserver (modal re-centres, emulated viewport,
+  // events skipped while the page was not rendering) — one rect read every 0.4 s, only while a copy is showing
+  setInterval(function () { if (ALL.some(function (st) { return st.shown; })) relayoutAll(); }, 400);
+  // devicePixelRatio changes (browser zoom, dragging to another screen) — re-arm each time
+  (function watchDpr() {
+    if (!window.matchMedia) return;
+    var mq = matchMedia("(resolution: " + (window.devicePixelRatio || 1) + "dppx)");
+    var on = function () { relayoutAll(); if (mq.removeEventListener) mq.removeEventListener("change", on); watchDpr(); };
+    if (mq.addEventListener) mq.addEventListener("change", on); else if (mq.addListener) mq.addListener(on);
+  })();
+
+  window.CrispPhoto = { attach: attach, stats: function () { return LOG.slice(); }, off: OFF, relayout: relayoutAll };
+  function auto() { ["sceneimg", "cuImg"].forEach(function (id) { var el = document.getElementById(id); if (el && el.tagName === "IMG") attach(el); }); }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", auto); else auto();
+})();
+</script>
+<!-- crisp-photo:end -->
 </body>
 </html>
